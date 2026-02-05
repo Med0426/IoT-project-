@@ -1,118 +1,101 @@
+import paho.mqtt.client as mqtt
 import json
 import math
-import paho.mqtt.client as mqtt
-from sqlalchemy import create_engine, text
-from collections import Counter, defaultdict  # <--- FIXED: Added defaultdict here
+from collections import defaultdict
+from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# --- CONFIGURATION ---
-DATABASE_URL = "postgresql://iot_user:password@localhost/iot_project" # UPDATE PASSWORD
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_TOPIC = "mahdi/iot/scan"
-
-# --- KNN SETTINGS ---
-K_NEIGHBORS = 5           # Look at the 5 closest matches
-RSSI_THRESHOLD = -85      # Ignore very weak signals
-PENALTY = 1000            # Penalty for missing MAC addresses
-
-# --- 1. LOAD ALL TRAINING DATA ---
-print("Loading raw training data...")
+# Database setup
+DATABASE_URL = "postgresql://iot_user:PASSWORD@localhost/iot_project"
+Base = declarative_base()
 engine = create_engine(DATABASE_URL)
-connection = engine.connect()
+Session = sessionmaker(bind=engine)
 
-result = connection.execute(text("SELECT location_label, mac_address, rssi, created_at FROM training_data"))
-rows = result.fetchall()
+class TrainingData(Base):
+    __tablename__ = 'training_data'
+    id = Column(Integer, primary_key=True)
+    location_label = Column(String)
+    mac_address = Column(String)
+    rssi = Column(Integer)
+    ssid = Column(String)
+    timestamp = Column(Float)
 
-# Reconstruct individual scans
-training_points = []
-temp_scans = {}
+def load_training_data():
+    """Loads and restructures DB rows into fingerprint vectors."""
+    session = Session()
+    raw_data = session.query(TrainingData).all()
+    
+    # Group raw rows by timestamp to reconstruct snapshots
+    grouped_data = defaultdict(list)
+    for row in raw_data:
+        grouped_data[row.timestamp].append(row)
 
-for label, mac, rssi, timestamp in rows:
-    key = str(timestamp)
-    if key not in temp_scans:
-        temp_scans[key] = {'label': label, 'data': {}}
-    temp_scans[key]['data'][mac] = rssi
+    fingerprints = []
+    for timestamp, rows in grouped_data.items():
+        scan_dict = {row.mac_address: row.rssi for row in rows}
+        label = rows[0].location_label
+        fingerprints.append({'label': label, 'data': scan_dict})
+    
+    return fingerprints
 
-training_points = list(temp_scans.values())
-print(f"✅ Brain Loaded! Stored {len(training_points)} distinct reference points.")
-
-# --- 2. MATH: EUCLIDEAN DISTANCE ---
 def get_distance(live_scan, stored_scan):
-    error = 0
-    matches = 0
+    """Calculates Euclidean distance with penalties for missing APs."""
+    all_macs = set(live_scan.keys()) | set(stored_scan.keys())
+    dist_sq = 0
     
-    for mac, stored_rssi in stored_scan.items():
-        if mac in live_scan:
-            live_rssi = live_scan[mac]
-            if live_rssi < RSSI_THRESHOLD: continue 
-            
-            diff = (live_rssi - stored_rssi) ** 2
-            error += diff
-            matches += 1
-        else:
-            error += PENALTY 
-            
-    if matches == 0: return float('inf')
-    return math.sqrt(error)
+    for mac in all_macs:
+        rssi_live = live_scan.get(mac, -100)
+        rssi_stored = stored_scan.get(mac, -100)
+        dist_sq += (rssi_live - rssi_stored) ** 2
+        
+    return math.sqrt(dist_sq)
 
-# --- 3. WEIGHTED KNN ALGORITHM ---
-def predict_location(live_scan_data):
-    # Calculate distance to EVERY point
+def predict_location(live_scan, k=5):
+    """Weighted KNN implementation."""
     distances = []
-    for point in training_points:
-        dist = get_distance(live_scan_data, point['data'])
-        if dist == 0: dist = 0.001 # Prevent division by zero
-        distances.append( (dist, point['label']) )
     
-    # Sort and pick Top K
+    for fp in training_data:
+        d = get_distance(live_scan, fp['data'])
+        distances.append((d, fp['label']))
+        
     distances.sort(key=lambda x: x[0])
-    neighbors = distances[:K_NEIGHBORS]
+    neighbors = distances[:k]
     
-    # WEIGHTED VOTING (Inverse Distance)
-    vote_scores = defaultdict(float) # <--- This caused your error before
-    
+    # Inverse distance weighting
+    scores = defaultdict(float)
     for dist, label in neighbors:
-        weight = 1.0 / dist
-        vote_scores[label] += weight
-    
-    # Find winner
-    winner = max(vote_scores, key=vote_scores.get)
-    
-    # Calculate confidence
-    raw_votes = [n[1] for n in neighbors]
-    vote_count = raw_votes.count(winner)
-    confidence = int((vote_count / K_NEIGHBORS) * 100)
-    
-    return winner, confidence, neighbors
+        weight = 1 / (dist + 0.1) 
+        scores[label] += weight
+        
+    return max(scores, key=scores.get)
 
-# --- 4. MQTT LISTENER ---
 def on_message(client, userdata, msg):
     try:
-        payload = msg.payload.decode()
-        data = json.loads(payload)
-        if "scans" not in data: return
-
-        live_scan = {item["mac"]: item["rssi"] for item in data["scans"]}
+        payload = json.loads(msg.payload.decode())
+        live_scan_list = payload.get("scans", [])
         
-        winner, confidence, top_k = predict_location(live_scan)
+        # Convert list to dict for O(1) lookups
+        live_scan = {item['mac']: item['rssi'] for item in live_scan_list}
         
-        # Check for uncertainty
-        best_dist = top_k[0][0]
-        if best_dist > 20.0:
-            print(f"❓ UNCERTAIN (Distance: {best_dist:.1f}) - Neighbors: {[n[1] for n in top_k]}")
-        else:
-            print("-" * 40)
-            print(f"📍 LOCATION: >> {winner} << ({confidence}% Confidence)")
-            print(f"   (Neighbors: { [n[1] for n in top_k] })")
-            print("-" * 40)
+        if not live_scan:
+            return
 
+        estimated_location = predict_location(live_scan)
+        print(f"Detected Location: {estimated_location}")
+        
+        # Write to shared file for frontend
+        with open("current_location.txt", "w") as f:
+            f.write(estimated_location)
+            
     except Exception as e:
         print(f"Error: {e}")
 
-# --- START ---
-print("Waiting for ESP32 data...")
-# Fix for DeprecationWarning: explicitly use version 2
-client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-client.on_connect = lambda c, u, f, rc, props: c.subscribe(MQTT_TOPIC)
+# Initialization
+training_data = load_training_data()
+print("Training data loaded. Starting inference engine...")
+
+client = mqtt.Client()
 client.on_message = on_message
-client.connect(MQTT_BROKER, 1883, 60)
+client.connect("broker.hivemq.com", 1883, 60)
+client.subscribe("mahdi/iot/scan")
 client.loop_forever()

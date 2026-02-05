@@ -1,96 +1,75 @@
-import json
 import paho.mqtt.client as mqtt
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base
-from datetime import datetime
-import time
+import json
+from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy.orm import declarative_base, sessionmaker
 
-# --- CONFIGURATION ---
-# REPLACE 'your_password' with your real DB password!
-DATABASE_URL = "postgresql://iot_user:password@localhost/iot_project"
-MQTT_BROKER = "broker.hivemq.com"
-MQTT_TOPIC = "mahdi/iot/scan"
-
-# --- DATABASE SETUP (New Table for Training) ---
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+# Database configuration
+DATABASE_URL = "postgresql://iot_user:PASSWORD@localhost/iot_project"
 Base = declarative_base()
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
+db = Session()
 
-# We create a specific table for LABELED data
+# Define table structure
 class TrainingData(Base):
-    __tablename__ = "training_data"
-    id = Column(Integer, primary_key=True, index=True)
-    location_label = Column(String, nullable=False) # e.g. "Kitchen"
-    mac_address = Column(String, nullable=False)
-    rssi = Column(Integer, nullable=False)
-    ssid = Column(String, nullable=True)
-    created_at = Column(DateTime, default=datetime.now)
+    __tablename__ = 'training_data'
+    id = Column(Integer, primary_key=True)
+    location_label = Column(String)
+    mac_address = Column(String)
+    rssi = Column(Integer)
+    ssid = Column(String)
+    timestamp = Column(Float)
 
-# Create the table immediately
-Base.metadata.create_all(bind=engine)
+# Initialize database
+Base.metadata.create_all(engine)
 
-# --- GLOBAL VARIABLES ---
-target_location = ""
+# User settings
+TARGET_LOCATION = input("Enter location label (e.g., KITCHEN): ").upper()
+SAMPLES_NEEDED = 40
 samples_collected = 0
-SAMPLES_NEEDED = 40  # How many ESP32 scans we want to capture per room
-
-def on_connect(client, userdata, flags, rc):
-    print(f" -> Connected to Cloud (Pulse: {rc})")
-    client.subscribe(MQTT_TOPIC)
 
 def on_message(client, userdata, msg):
     global samples_collected
     
+    if samples_collected >= SAMPLES_NEEDED:
+        print(f"Collection complete for {TARGET_LOCATION}.")
+        client.disconnect()
+        return
+
     try:
-        payload = msg.payload.decode()
-        data = json.loads(payload)
+        payload = json.loads(msg.payload.decode())
+        scans = payload.get("scans", [])
+
+        if not scans:
+            return
+
+        # Use a single timestamp for the batch
+        current_time = 12345.67 
         
-        if "scans" in data:
-            db = SessionLocal()
-            count = 0
-            
-            # Save every WiFi network in this scan with the label
-            for item in data["scans"]:
-                new_entry = TrainingData(
-                    location_label=target_location,
-                    mac_address=item["mac"],
-                    rssi=item["rssi"],
-                    ssid=item["ssid"]
-                )
-                db.add(new_entry)
-                count += 1
-            
-            db.commit()
-            db.close()
-            
-            samples_collected += 1
-            print(f" [Sample {samples_collected}/{SAMPLES_NEEDED}] Saved {count} networks for '{target_location}'")
-            
-            if samples_collected >= SAMPLES_NEEDED:
-                print(f"\n✅ CALIBRATION COMPLETE for {target_location}!")
-                client.disconnect()
+        print(f"Saving sample {samples_collected + 1}/{SAMPLES_NEEDED}...")
+
+        # Batch insert
+        for network in scans:
+            new_data = TrainingData(
+                location_label=TARGET_LOCATION,
+                mac_address=network['mac'],
+                rssi=network['rssi'],
+                ssid=network.get('ssid', 'HIDDEN'),
+                timestamp=current_time
+            )
+            db.add(new_data)
+        
+        db.commit()
+        samples_collected += 1
 
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error processing message: {e}")
 
-# --- MAIN INTERACTIVE LOOP ---
-if __name__ == "__main__":
-    print("\n--- IOT LOCATION CALIBRATION ---")
-    
-    # 1. Ask the user where they are
-    target_location = input("ENTER LOCATION NAME (e.g., Kitchen, Desk): ").strip().upper()
-    
-    if not target_location:
-        print("Error: You must enter a name.")
-        exit()
+# MQTT setup
+client = mqtt.Client()
+client.on_message = on_message
+client.connect("broker.hivemq.com", 1883, 60)
+client.subscribe("mahdi/iot/scan")
 
-    print(f"\n[INSTRUCTION] Please stand in the {target_location} with your ESP32.")
-    print("Collecting data... (Wait ~30 seconds)")
-
-    # 2. Start Listening
-    client = mqtt.Client()
-    client.on_connect = on_connect
-    client.on_message = on_message
-
-    client.connect(MQTT_BROKER, 1883, 60)
-    client.loop_forever()
+print(f"Listening for data. Target: {TARGET_LOCATION}...")
+client.loop_forever()
